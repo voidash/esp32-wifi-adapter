@@ -1,4 +1,14 @@
+use std::sync::mpsc::{channel, Sender};
+use std::thread;
+
+use esp_idf_svc::eventloop::EspSystemEventLoop;
+use esp_idf_svc::hal::peripherals::Peripherals;
+use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::sys::{xRingbufferCreate, RingbufferType_t_RINGBUF_TYPE_NOSPLIT, ESP_ERR_NVS_NO_FREE_PAGES, ESP_ERR_NVS_NEW_VERSION_FOUND, nvs_flash_erase, nvs_flash_init, uart_config_t, uart_word_length_t_UART_DATA_8_BITS, uart_parity_t_UART_PARITY_DISABLE, uart_stop_bits_t_UART_STOP_BITS_2, uart_hw_flowcontrol_t_UART_HW_FLOWCTRL_DISABLE, uart_sclk_t_UART_SCLK_APB, uart_config_t__bindgen_ty_1, uart_set_pin, UART_NUM_0, UART_PIN_NO_CHANGE, uart_port_t, gpio_num_t_GPIO_NUM_2, gpio_num_t_GPIO_NUM_1, gpio_num_t_GPIO_NUM_3, uart_driver_install, uart_param_config, RingbufHandle_t, xRingbufferReceive, uart_write_bytes, vRingbufferReturnItem, uart_read_bytes, xRingbufferSend, vTaskDelay, esp_event_handler_register, WIFI_EVENT, ESP_EVENT_ANY_ID};
+
+use esp_idf_svc::wifi::*;
+
+use anyhow::Result;
 
 macro_rules! error_check {
     ($x:expr) => {
@@ -79,6 +89,7 @@ fn parse_info(line: &str) -> Option<NetworkInfo> {
 
 const BAUD_RATE: i32 = 9600;
 
+// alot of unsafe UART stuff here
 fn initiazlize_uart() {
     let uart_config = uart_config_t {
         baud_rate: BAUD_RATE,
@@ -155,9 +166,38 @@ fn uart_rx(serial_to_wifi: &RingbufHandle_t) {
     }
 }
 
-fn initialize_wifi() {
+
+fn initialize_wifi(wifi: &mut EspWifi<'static>) -> Result<()> {
     // error_check!(unsafe {esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, on_wifi_event, ) });
+    let wifi_configuration : Configuration = Configuration::AccessPoint(AccessPointConfiguration {
+        ssid: "awesome".into(),
+        ssid_hidden: false ,
+        channel: 1,
+        secondary_channel: None,
+        protocols: Protocol::P802D11LR.into(),
+        auth_method: AuthMethod::None, 
+        password: "".into(),  
+        max_connections:4,
+    });
+    
+    wifi.set_configuration(&wifi_configuration)?;
+    wifi.start()?;
+
+    Ok(())
 }
+
+fn on_wifi_event(event: &WifiEvent) {
+   let client_counter = 0; 
+    
+   match event {
+       WifiEvent::ApStarted => {
+           log::info!("AP started i guess");
+       }
+       _ => {
+            log::info!("happened");
+       }
+   }
+} 
 
 // TODO: look into Netstack-lwip
 // TODO: look into pbuf 
@@ -190,32 +230,62 @@ fn read_line() -> String {
     line.iter().collect()
 }
 
-
-fn main() -> Result<(), esp_idf_svc::sys::EspError>{
+fn main() -> Result<()>{
     // It is necessary to call this function once. Otherwise some patches to the runtime
     // implemented by esp-idf-sys might not link properly. See https://github.com/esp-rs/esp-idf-template/issues/71
     esp_idf_svc::sys::link_patches();
 
     // Bind the log crate to the ESP Logging facilities
     esp_idf_svc::log::EspLogger::initialize_default();
+    let peripherals = Peripherals::take()?;
+    let sys_loop = EspSystemEventLoop::take()?;
+    let nvs = EspDefaultNvsPartition::take()?;
+
+    let (tx,rx) = channel();
+
+
+
+    let mut wifi = EspWifi::new(peripherals.modem, sys_loop.clone(), Some(nvs))?;
+
 
     // create xRingBufferCreate 
     let wifi_to_serial = unsafe{xRingbufferCreate(1024*32, RingbufferType_t_RINGBUF_TYPE_NOSPLIT)};
     let serial_to_wifi = unsafe{xRingbufferCreate(1024*32, RingbufferType_t_RINGBUF_TYPE_NOSPLIT)};
 
-    let ret = unsafe{nvs_flash_init()};
-    if ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND {
-        if let Ok(_) = error_check!(unsafe{nvs_flash_erase()}) {
-            error_check!(unsafe{nvs_flash_init()},"can't init non volatile storage");
+    initialize_wifi(&mut wifi)?;
+
+    log::info!("Awesome ESP32 based wifi dongle");
+
+    sys_loop.subscribe(move |event: &WifiEvent| {
+        let _ = tx.send(*event);
+    })?;
+
+
+
+        let k = thread::spawn(move || {
+            loop {
+                match rx.recv() {
+                    Ok(ok) => {
+                        log::info!("Got values {:?}", ok);
+                    }
+                    Err(_) => {
+                        // log::info!("Haven't received");
+                    }
+                }
+            }
+        });
+
+        loop {
+            let line = read_line();
+            let parsed_value = parse_info(&line);
+
+                
+           
+            log::info!("{:?}", parsed_value);
         }
-    }
 
-
-    log::info!("Good things are coming");
-    loop {
-        let line = read_line();
-        let parsed_value = parse_info(&line);
-        log::info!("{:?}", parsed_value);
-    }
+        // k.join().unwrap();
+        //
+        // Ok(())
 
 }
