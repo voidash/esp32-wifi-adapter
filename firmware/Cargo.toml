@@ -31,6 +31,7 @@ anyhow = "1.0.75"
 strum = "0.25.0"
 strum_macros = "0.25.0"
 lazy_static = "1.4.0"
+ringbuffer = "0.15.0"
 
 [build-dependencies]
 embuild = "0.31.3"

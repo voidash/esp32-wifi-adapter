@@ -5,15 +5,17 @@ use std::sync::{RwLock, Mutex, Arc};
 
 use esp_idf_svc::sys::{xRingbufferCreate, RingbufferType_t_RINGBUF_TYPE_NOSPLIT, ESP_ERR_NVS_NO_FREE_PAGES, ESP_ERR_NVS_NEW_VERSION_FOUND, uart_config_t, uart_word_length_t_UART_DATA_8_BITS, uart_parity_t_UART_PARITY_DISABLE, uart_stop_bits_t_UART_STOP_BITS_2, uart_hw_flowcontrol_t_UART_HW_FLOWCTRL_DISABLE, uart_sclk_t_UART_SCLK_APB, uart_config_t__bindgen_ty_1, uart_set_pin, UART_NUM_0, UART_PIN_NO_CHANGE, uart_port_t, gpio_num_t_GPIO_NUM_1, gpio_num_t_GPIO_NUM_3, uart_driver_install, uart_param_config, RingbufHandle_t, xRingbufferReceive, uart_write_bytes, vRingbufferReturnItem, uart_read_bytes, xRingbufferSend, vTaskDelay, esp_event_handler_register, WIFI_EVENT, ESP_EVENT_ANY_ID, esp_wifi_init, wifi_init_config_t, esp_wifi_set_storage, wifi_storage_t_WIFI_STORAGE_RAM, wifi_interface_t_WIFI_IF_AP, wifi_scan_method_t_WIFI_FAST_SCAN, esp_netif_init, esp_netif_create_default_wifi_sta, esp_netif_ip_info_t, esp_ip4_addr, esp_netif_dhcpc_stop, esp_netif_set_ip_info, wifi_sort_method_t_WIFI_CONNECT_AP_BY_SIGNAL, wifi_pmf_config_t, esp_wifi_set_ps, wifi_ps_type_t_WIFI_PS_NONE, esp_wifi_set_protocol, wifi_mode_t_WIFI_MODE_AP, wifi_mode_t_WIFI_MODE_STA, esp_event_base_t, esp_wifi_internal_reg_rxcb, esp_wifi_connect};
 
+use ringbuffer::{AllocRingBuffer, RingBuffer};
 use strum_macros::FromRepr;
 use std::ffi::CString;
+
 
 
 lazy_static! {
     static ref PARSED_VALUE: RwLock<NetworkInfo> = RwLock::new(NetworkInfo::AP(NetworkDefaults::default(),2));
 
-    static ref WIFI_TO_SERIAL: Arc<Mutex<RingbufHandle_t>> = Arc::new(Mutex::new(unsafe{xRingbufferCreate(1024*32, RingbufferType_t_RINGBUF_TYPE_NOSPLIT)}));
-    // static ref SERIAL_TO_WIFI: Mutex<RingbufHandle_t> = Mutex::new(unsafe{xRingbufferCreate(1024*32, RingbufferType_t_RINGBUF_TYPE_NOSPLIT)});
+    static ref WIFI_TO_SERIAL: AllocRingBuffer<u8> = AllocRingBuffer::new(1024*32);    
+    static ref SERIAL_TO_WIFI: AllocRingBuffer<u8> = AllocRingBuffer::new(1024*16);
 }
 
 use anyhow::Result;
@@ -179,8 +181,7 @@ fn initiazlize_uart() {
 fn uart_tx() {
     let mut len: usize = 0;
     loop {
-        let val = unsafe{xRingbufferReceive(WIFI_TO_SERIAL, &mut len, 0xFFFFFFFF) };
-        let buffer = unsafe {std::ffi::CStr::from_ptr(val as *const i8)}.to_bytes(); 
+        let buffer = WIFI_TO_SERIAL.to_vec();
 
         let mut header: [u8; 4] = [0xAA, 0 , (len as u8) & 0xFF, (len >> 8) as u8 & 0xFF];
 
@@ -194,7 +195,6 @@ fn uart_tx() {
         unsafe{uart_write_bytes(UART_NUM_0 as i32, header.as_mut_ptr().cast() as *const std::ffi::c_void, 4)};
         unsafe{uart_write_bytes(UART_NUM_0 as i32, buffer.as_ptr().cast() as *const std::ffi::c_void, 4)};
 
-        unsafe{vRingbufferReturnItem(WIFI_TO_SERIAL.clone(), val)};
     }
 }
 
@@ -227,7 +227,10 @@ fn uart_rx(serial_to_wifi: &RingbufHandle_t) {
         }
 
         if acc == 0 {
-            unsafe{xRingbufferSend(SERIAL_TO_WIFI, buffer.as_mut_ptr().cast() , len.into(), 0);}
+            // unsafe{xRingbufferSend(SERIAL_TO_WIFI, buffer.as_mut_ptr().cast() , len.into(), 0);}
+            for i in 0..len{
+                SERIAL_TO_WIFI.push(buffer[i as usize]);
+            }
         } 
     }
 }
@@ -368,15 +371,6 @@ fn initialize_wifi() -> Result<()> {
     Ok(())
 }
 
-// pub type esp_event_handler_t = ::core::option::Option<
-//     unsafe extern "C" fn(
-//         event_handler_arg: *mut ::core::ffi::c_void,
-//         event_base: esp_event_base_t,
-//         event_id: i32,
-//         event_data: *mut ::core::ffi::c_void,
-//     ),
-// >;
-//
 unsafe extern "C" fn on_wifi_event(event_handler_arg: *mut ::core::ffi::c_void, event_base: esp_event_base_t , event_id: i32, event_data: *mut ::core::ffi::c_void) {
         use WifiEvent::*;
 
@@ -423,7 +417,7 @@ fn wifi_tx() {
     let mut len: usize = 0;
 
     loop {
-        let buffer = unsafe{ xRingbufferReceive(SERIAL_TO_WIFI, &mut len, 0xFFFFFFFF) };
+        // let buffer = unsafe{ xRingbufferReceive(SERIAL_TO_WIFI, &mut len, 0xFFFFFFFF) };
     }
 }
 
@@ -460,20 +454,21 @@ fn main() -> Result<()>{
     esp_idf_svc::log::EspLogger::initialize_default();
 
 
-    // create xRingBufferCreate 
+    // let mut buffer = AllocRingBuffer::with_capacity(1024*16);
 
 
     log::info!("Awesome ESP32 based wifi dongle");
 
 
 
-
     let line = read_line();
-    let mut parsed_value = PARSED_VALUE.write().unwrap();
-    *PARSED_VALUE = parse_info(&line).unwrap().into();
+    {
+        let mut parsed_value = PARSED_VALUE.write().unwrap();
+        *PARSED_VALUE = parse_info(&line).unwrap().into();
+    }
 
    
-    log::info!("{:?}", *PARSED_VALUE);
+    log::info!("{:?}", PARSED_VALUE.read().unwrap());
 
     initialize_wifi()?;
 
