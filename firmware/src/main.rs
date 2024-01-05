@@ -1,21 +1,30 @@
 #[macro_use]
 extern crate lazy_static;
 
-use std::sync::{RwLock, Mutex, Arc};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use std::{sync::RwLock, thread};
 
-use esp_idf_svc::sys::{xRingbufferCreate, RingbufferType_t_RINGBUF_TYPE_NOSPLIT, ESP_ERR_NVS_NO_FREE_PAGES, ESP_ERR_NVS_NEW_VERSION_FOUND, uart_config_t, uart_word_length_t_UART_DATA_8_BITS, uart_parity_t_UART_PARITY_DISABLE, uart_stop_bits_t_UART_STOP_BITS_2, uart_hw_flowcontrol_t_UART_HW_FLOWCTRL_DISABLE, uart_sclk_t_UART_SCLK_APB, uart_config_t__bindgen_ty_1, uart_set_pin, UART_NUM_0, UART_PIN_NO_CHANGE, uart_port_t, gpio_num_t_GPIO_NUM_1, gpio_num_t_GPIO_NUM_3, uart_driver_install, uart_param_config, RingbufHandle_t, xRingbufferReceive, uart_write_bytes, vRingbufferReturnItem, uart_read_bytes, xRingbufferSend, vTaskDelay, esp_event_handler_register, WIFI_EVENT, ESP_EVENT_ANY_ID, esp_wifi_init, wifi_init_config_t, esp_wifi_set_storage, wifi_storage_t_WIFI_STORAGE_RAM, wifi_interface_t_WIFI_IF_AP, wifi_scan_method_t_WIFI_FAST_SCAN, esp_netif_init, esp_netif_create_default_wifi_sta, esp_netif_ip_info_t, esp_ip4_addr, esp_netif_dhcpc_stop, esp_netif_set_ip_info, wifi_sort_method_t_WIFI_CONNECT_AP_BY_SIGNAL, wifi_pmf_config_t, esp_wifi_set_ps, wifi_ps_type_t_WIFI_PS_NONE, esp_wifi_set_protocol, wifi_mode_t_WIFI_MODE_AP, wifi_mode_t_WIFI_MODE_STA, esp_event_base_t, esp_wifi_internal_reg_rxcb, esp_wifi_connect};
+use std::sync::mpsc::channel;
+
+use esp_idf_hal::task::watchdog::{TWDTConfig, self};
+use esp_idf_hal::task::watchdog::TWDTDriver;
+use esp_idf_svc::sys::{ ESP_ERR_NVS_NO_FREE_PAGES, ESP_ERR_NVS_NEW_VERSION_FOUND, uart_config_t, uart_word_length_t_UART_DATA_8_BITS, uart_parity_t_UART_PARITY_DISABLE, uart_stop_bits_t_UART_STOP_BITS_2, uart_hw_flowcontrol_t_UART_HW_FLOWCTRL_DISABLE, uart_sclk_t_UART_SCLK_APB, uart_config_t__bindgen_ty_1, uart_set_pin, UART_NUM_0, UART_PIN_NO_CHANGE, uart_port_t, gpio_num_t_GPIO_NUM_1, gpio_num_t_GPIO_NUM_3, uart_driver_install, uart_param_config, uart_read_bytes, vTaskDelay, esp_event_handler_register, WIFI_EVENT, ESP_EVENT_ANY_ID, esp_wifi_init, wifi_init_config_t, esp_wifi_set_storage, wifi_storage_t_WIFI_STORAGE_RAM, wifi_interface_t_WIFI_IF_AP, wifi_scan_method_t_WIFI_FAST_SCAN, esp_netif_init, esp_netif_create_default_wifi_sta, esp_netif_ip_info_t, esp_ip4_addr, esp_netif_dhcpc_stop, esp_netif_set_ip_info, wifi_sort_method_t_WIFI_CONNECT_AP_BY_SIGNAL, wifi_pmf_config_t, esp_wifi_set_ps, wifi_ps_type_t_WIFI_PS_NONE, esp_wifi_set_protocol, wifi_mode_t_WIFI_MODE_AP, wifi_mode_t_WIFI_MODE_STA, esp_event_base_t, esp_wifi_connect, uart_write_bytes} ;
 
 use ringbuffer::{AllocRingBuffer, RingBuffer};
 use strum_macros::FromRepr;
 use std::ffi::CString;
-
+use esp_idf_hal::delay::BLOCK;
+use esp_idf_hal::gpio;
+use esp_idf_hal::prelude::*;
+use esp_idf_hal::uart::*;
 
 
 lazy_static! {
     static ref PARSED_VALUE: RwLock<NetworkInfo> = RwLock::new(NetworkInfo::AP(NetworkDefaults::default(),2));
 
-    static ref WIFI_TO_SERIAL: AllocRingBuffer<u8> = AllocRingBuffer::new(1024*32);    
-    static ref SERIAL_TO_WIFI: AllocRingBuffer<u8> = AllocRingBuffer::new(1024*16);
+    static ref WIFI_TO_SERIAL: RwLock<AllocRingBuffer<u8>> = RwLock::new(AllocRingBuffer::new(1024*32));    
+    static ref SERIAL_TO_WIFI: RwLock<AllocRingBuffer<u8>> = RwLock::new(AllocRingBuffer::new(1024*16));
 }
 
 use anyhow::Result;
@@ -155,33 +164,60 @@ fn parse_info(line: &str) -> Option<NetworkInfo> {
 }
 
 
-const BAUD_RATE: i32 = 9600;
+const BAUD_RATE: u32 = 9600;
 
 // alot of unsafe UART stuff here
-fn initiazlize_uart() {
-    let uart_config = uart_config_t {
-        baud_rate: BAUD_RATE,
-        data_bits: uart_word_length_t_UART_DATA_8_BITS,
-        parity: uart_parity_t_UART_PARITY_DISABLE,
-        stop_bits: uart_stop_bits_t_UART_STOP_BITS_2,
-        flow_ctrl: 0,
-        rx_flow_ctrl_thresh: uart_hw_flowcontrol_t_UART_HW_FLOWCTRL_DISABLE as u8,
-        __bindgen_anon_1: uart_config_t__bindgen_ty_1 { source_clk: uart_sclk_t_UART_SCLK_APB },
-    };
-
-    error_check!(unsafe{uart_set_pin(UART_NUM_0 as uart_port_t, gpio_num_t_GPIO_NUM_1 ,gpio_num_t_GPIO_NUM_3, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE)}, "cannot set uart");
-
-    error_check!(unsafe{uart_driver_install(UART_NUM_0 as uart_port_t,256,256 , 0, core::ptr::null_mut(), 0)}, "can't install UART");
-    error_check!(unsafe{uart_param_config(UART_NUM_0 as uart_port_t, &uart_config)}, "cannot set the UART parameter");
+fn initiazlize_uart() -> anyhow::Result<()>{
+    // let uart_config = uart_config_t {
+    //     baud_rate: BAUD_RATE as i32,
+    //     data_bits: uart_word_length_t_UART_DATA_8_BITS,
+    //     parity: uart_parity_t_UART_PARITY_DISABLE,
+    //     stop_bits: uart_stop_bits_t_UART_STOP_BITS_2,
+    //     flow_ctrl: 0,
+    //     rx_flow_ctrl_thresh: uart_hw_flowcontrol_t_UART_HW_FLOWCTRL_DISABLE as u8,
+    //     __bindgen_anon_1: uart_config_t__bindgen_ty_1 { source_clk: uart_sclk_t_UART_SCLK_APB },
+    // };
+    //
+    // error_check!(unsafe{uart_set_pin(UART_NUM_0 as uart_port_t, gpio_num_t_GPIO_NUM_1 ,gpio_num_t_GPIO_NUM_3, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE)}, "cannot set uart");
+    //
+    // error_check!(unsafe{uart_driver_install(UART_NUM_0 as uart_port_t,256,256 , 0, core::ptr::null_mut(), 0)}, "can't install UART");
+    // error_check!(unsafe{uart_param_config(UART_NUM_0 as uart_port_t, &uart_config)}, "cannot set the UART parameter");
     // initialize Tx and Rx
+
+    // thread::spawn(|| { uart_rx(); });
+    // thread::spawn(|| { uart_tx(); });
+
+    let peripherals = Peripherals::take()?;
+
+    let tx = peripherals.pins.gpio1;
+    let rx = peripherals.pins.gpio3;
+
+    let config = config::Config::new().baudrate(Hertz(BAUD_RATE));
+
+    let uart = Arc::new(Mutex::new(UartDriver::new(
+        peripherals.uart0,
+        tx,
+        rx,
+        Option::<gpio::Gpio0>::None,
+        Option::<gpio::Gpio1>::None,
+        &config
+      )?));
+
+    let u1 = uart.clone();
+    let u2 = uart.clone();
+
+    // thread::spawn(move ||{uart_tx(u1)});
+    // thread::spawn(move ||{uart_rx(u2)});
+
+    Ok(())
 }
 
-
-
-fn uart_tx() {
-    let mut len: usize = 0;
+fn uart_tx(uart: Arc<Mutex<UartDriver>> ) {
     loop {
-        let buffer = WIFI_TO_SERIAL.to_vec();
+
+        let buffer = WIFI_TO_SERIAL.read().unwrap().to_vec();
+        // let buffer = [0,1,2,34,5,6,7,8,9];
+        let len: usize = buffer.len();
 
         let mut header: [u8; 4] = [0xAA, 0 , (len as u8) & 0xFF, (len >> 8) as u8 & 0xFF];
 
@@ -192,34 +228,47 @@ fn uart_tx() {
         }
 
         //uart-write-bytes
-        unsafe{uart_write_bytes(UART_NUM_0 as i32, header.as_mut_ptr().cast() as *const std::ffi::c_void, 4)};
-        unsafe{uart_write_bytes(UART_NUM_0 as i32, buffer.as_ptr().cast() as *const std::ffi::c_void, 4)};
+        // unsafe{uart_write_bytes(UART_NUM_0 as i32, header.as_mut_ptr().cast() as *const std::ffi::c_void, 4)};
+        // unsafe{uart_write_bytes(UART_NUM_0 as i32, buffer.as_ptr().cast() as *const std::ffi::c_void, 4)};
 
+        let uart = uart.lock().unwrap();
+        uart.write(&header).unwrap();
+        uart.write(&buffer).unwrap();
     }
 }
 
 
-fn uart_rx(serial_to_wifi: &RingbufHandle_t) {
+fn uart_rx(uart: Arc<Mutex<UartDriver>>) {
     loop {
         let mut buffer = [0u8;2000];
         loop {
+            let uart = uart.lock().unwrap();
             unsafe{uart_read_bytes(UART_NUM_0 as i32, (&mut buffer[0..0]).as_mut_ptr().cast(), 1, 0xFFFFFFFF);}
+            uart.read(&mut buffer[0..0],BLOCK).unwrap();
 
             if buffer[0] == 0xAA {break;}
         }
 
-        unsafe{uart_read_bytes(UART_NUM_0 as i32, (&mut buffer[1..1]).as_mut_ptr().cast(), 1, 0xFFFFFFFF);}
-        unsafe{uart_read_bytes(UART_NUM_0 as i32, (&mut buffer[2..2]).as_mut_ptr().cast(), 1, 0xFFFFFFFF);}
-        unsafe{uart_read_bytes(UART_NUM_0 as i32, (&mut buffer[3..3]).as_mut_ptr().cast(), 1, 0xFFFFFFFF);}
+        let uart = uart.lock().unwrap();
+        uart.read(&mut buffer[1..1],BLOCK).unwrap();
+        uart.read(&mut buffer[2..2],BLOCK).unwrap();
+        uart.read(&mut buffer[2..2],BLOCK).unwrap();
+        // unsafe{uart_read_bytes(UART_NUM_0 as i32, (&mut buffer[1..1]).as_mut_ptr().cast(), 1, 0xFFFFFFFF);}
+        // unsafe{uart_read_bytes(UART_NUM_0 as i32, (&mut buffer[2..2]).as_mut_ptr().cast(), 1, 0xFFFFFFFF);}
+        // unsafe{uart_read_bytes(UART_NUM_0 as i32, (&mut buffer[3..3]).as_mut_ptr().cast(), 1, 0xFFFFFFFF);}
+
 
         let len = buffer[2] as u16 | (buffer[3] as u16) << 8;
         if 4 + len as usize > buffer.len() * 4 {
             continue;
         }
 
-        for i in 0..len {
-            unsafe{uart_read_bytes(UART_NUM_0 as i32, (&mut buffer[(4+i as usize)..(4+i as usize)]).as_mut_ptr().cast(), 1, 0xFFFFFFFF);}
+        for i in 0..(len as usize) {
+            // unsafe{uart_read_bytes(UART_NUM_0 as i32, (&mut buffer[(4+i as usize)..(4+i as usize)]).as_mut_ptr().cast(), 1, 0xFFFFFFFF);}
+            uart.read(&mut buffer[4+i..4+i],BLOCK).unwrap();
         }
+
+        println!("{:?}",buffer);
 
         let mut acc = 0;
         for i in 0..(4+len) {
@@ -229,7 +278,7 @@ fn uart_rx(serial_to_wifi: &RingbufHandle_t) {
         if acc == 0 {
             // unsafe{xRingbufferSend(SERIAL_TO_WIFI, buffer.as_mut_ptr().cast() , len.into(), 0);}
             for i in 0..len{
-                SERIAL_TO_WIFI.push(buffer[i as usize]);
+                SERIAL_TO_WIFI.write().unwrap().push(buffer[i as usize]);
             }
         } 
     }
@@ -277,8 +326,8 @@ fn initialize_wifi() -> Result<()> {
 
         error_check!(esp_wifi_set_storage(wifi_storage_t_WIFI_STORAGE_RAM))?;
         
-        match *PARSED_VALUE.read().unwrap() {
-              NetworkInfo::AP(config,baudrate) => {
+        match &(*(PARSED_VALUE.read().unwrap())) {
+              NetworkInfo::AP(config,_baudrate) => {
                 // Access point
                 error_check!(esp_idf_svc::sys::esp_wifi_set_mode(esp_idf_svc::sys::wifi_mode_t_WIFI_MODE_AP), "Can't set wifi mode to AP");
 
@@ -297,7 +346,7 @@ fn initialize_wifi() -> Result<()> {
                     }
                 };
                 set_str(&mut ap_config.ap.ssid, &config.ssid);
-                match config.password {
+                match &config.password {
                     Some(password) => {
                         set_str(&mut ap_config.ap.password, &password);
                     }
@@ -350,7 +399,7 @@ fn initialize_wifi() -> Result<()> {
 
                 
                 set_str(&mut sta_config.ap.ssid, &config.ssid);
-                match config.password {
+                match &config.password {
                     Some(password) => {
                         set_str(&mut sta_config.ap.password, &password);
                     }
@@ -368,6 +417,7 @@ fn initialize_wifi() -> Result<()> {
         // spawn thread for wifi_tx
 
     }
+    thread::spawn(|| {wifi_tx()});
     Ok(())
 }
 
@@ -414,10 +464,11 @@ fn wifi_tx() {
     // create packet buffer 
     // check type of payload and send it
     //
-    let mut len: usize = 0;
-
+    // let mut len: usize = 0;
     loop {
-        // let buffer = unsafe{ xRingbufferReceive(SERIAL_TO_WIFI, &mut len, 0xFFFFFFFF) };
+        let buffer = SERIAL_TO_WIFI.read().unwrap();
+        let len = buffer.len();
+
     }
 }
 
@@ -453,24 +504,38 @@ fn main() -> Result<()>{
     // Bind the log crate to the ESP Logging facilities
     esp_idf_svc::log::EspLogger::initialize_default();
 
+    // let peripherals = Peripherals::take()?;
+
+    // let config = TWDTConfig{
+    //     panic_on_trigger: false,
+    //     duration: Duration::from_secs(5),
+    //     ..Default::default()
+    // };
+
+    // let mut driver = TWDTDriver::new(peripherals.twdt , &config)?;
+
+    // let mut watchdog = driver.watch_current_task()?;
+
 
     // let mut buffer = AllocRingBuffer::with_capacity(1024*16);
-
 
     log::info!("Awesome ESP32 based wifi dongle");
 
 
+    // watchdog.feed()?;
+    // unsafe { vTaskDelay(3) };
 
-    let line = read_line();
-    {
-        let mut parsed_value = PARSED_VALUE.write().unwrap();
-        *PARSED_VALUE = parse_info(&line).unwrap().into();
-    }
+    // let line = read_line();
+    // {
+    //     let mut parsed_value = PARSED_VALUE.write().unwrap();
+    //     *parsed_value = parse_info(&line).unwrap().into();
+    // }
 
-   
-    log::info!("{:?}", PARSED_VALUE.read().unwrap());
 
-    initialize_wifi()?;
+    // log::info!("{:?}", PARSED_VALUE.read().unwrap());
+   //
+    // initialize_wifi()?;
+    initiazlize_uart()?;
 
     Ok(())
 }
